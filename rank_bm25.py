@@ -68,6 +68,7 @@ class BM25:
         raise NotImplementedError()
 
     def get_top_n(self, query, documents, n=5):
+        """Deprecated."""
 
         assert self.corpus_size == len(
             documents
@@ -76,6 +77,302 @@ class BM25:
         scores = self.get_scores(query)
         top_n = np.argsort(scores)[::-1][:n]
         return [documents[i] for i in top_n]
+
+    def search(
+        self, queries: np.ndarray | list, k: int
+    ) -> tuple[np.ndarray, np.ndarray]:
+        if isinstance(queries, np.ndarray):
+            assert queries.ndim == 2
+        else:
+            assert isinstance(queries, list), type(queries)
+            assert isinstance(queries[0], list), type(queries[0])
+            assert isinstance(queries[0][0], str), type(queries[0][0])
+
+        all_scores = []
+        all_indices = []
+        for q in queries:
+            scores = self.get_scores(q)
+            top_n = np.argsort(scores)[::-1][:k]
+            scores_srt = np.array([scores[i] for i in top_n])
+
+            all_scores.append(scores_srt)
+            all_indices.append(top_n)
+
+        all_scores = np.array(all_scores)
+        all_indices = np.array(all_indices)
+
+        return all_scores, all_indices
+
+
+class IDF(BM25):
+    def __init__(self, corpus, tokenizer=None):
+        super().__init__(corpus, tokenizer)
+
+    def _calc_idf(self, nd):
+        """
+        Calculate IDF using the standard IDF formula: log(N/df)
+        where N is the total number of documents and df is document frequency
+        """
+        self.idf = {}
+        for word, freq in nd.items():
+            # Standard IDF calculation
+            idf = math.log(
+                self.corpus_size / (freq + 1)
+            )  # +1 to avoid division by zero
+            self.idf[word] = idf
+
+    def get_scores(self, query):
+        """
+        Calculate IDF scores: IDF
+        - IDF is pre-calculated in _calc_idf
+        - No length normalization or parameters like in BM25
+        """
+        score = np.zeros(self.corpus_size)
+        for q in query:
+            # Get term frequency for query term across all documents
+            # IDF score = term frequency × inverse document frequency
+            score += self.idf.get(q) or 0
+        return score
+
+    def get_batch_scores(self, query, doc_ids):
+        """
+        Calculate IDF scores for a subset of documents
+        """
+        assert all(di < len(self.doc_freqs) for di in doc_ids)
+        score = np.zeros(len(doc_ids))
+        for q in query:
+            # IDF score = term frequency × inverse document frequency
+            score += self.idf.get(q) or 0
+        return score.tolist()
+
+
+class TFIDF_A(BM25):  # Grok
+    def __init__(self, corpus, tokenizer=None):
+        super().__init__(corpus, tokenizer)
+
+    def _calc_idf(self, nd):
+        """
+        Calculate IDF using the standard TF-IDF formula: log(N/df)
+        where N is the total number of documents and df is document frequency
+        """
+        self.idf = {}
+        for word, freq in nd.items():
+            # Standard TF-IDF IDF calculation
+            idf = math.log(
+                self.corpus_size / (freq + 1)
+            )  # +1 to avoid division by zero
+            self.idf[word] = idf
+
+    def get_scores(self, query):
+        """
+        Calculate TF-IDF scores: TF × IDF
+        - TF is the raw term frequency
+        - IDF is pre-calculated in _calc_idf
+        - No length normalization or parameters like in BM25
+        """
+        score = np.zeros(self.corpus_size)
+        for q in query:
+            # Get term frequency for query term across all documents
+            q_freq = np.array([(doc.get(q) or 0) for doc in self.doc_freqs])
+            # TF-IDF score = term frequency × inverse document frequency
+            score += q_freq * (self.idf.get(q) or 0)
+        return score
+
+    def get_batch_scores(self, query, doc_ids):
+        """
+        Calculate TF-IDF scores for a subset of documents
+        """
+        assert all(di < len(self.doc_freqs) for di in doc_ids)
+        score = np.zeros(len(doc_ids))
+        for q in query:
+            q_freq = np.array([(self.doc_freqs[di].get(q) or 0) for di in doc_ids])
+            # TF-IDF score = term frequency × inverse document frequency
+            score += q_freq * (self.idf.get(q) or 0)
+        return score.tolist()
+
+
+class TFIDF_B(BM25):  # Claude
+    def __init__(self, corpus, tokenizer=None, smooth_idf=True, norm=None):
+        """
+        Initialize the TF-IDF scoring model.
+
+        Args:
+            corpus: List of documents, where each document is a list of tokens
+            tokenizer: Optional tokenizer function to process raw text
+            smooth_idf: Whether to add 1 to document frequencies to prevent division by zero
+            norm: Normalization method ('l1', 'l2', or None)
+        """
+        self.smooth_idf = smooth_idf
+        self.norm = norm
+        super().__init__(corpus, tokenizer)
+
+    def _calc_idf(self, nd):
+        """
+        Calculate Inverse Document Frequency for each term.
+
+        Args:
+            nd: Dictionary mapping terms to their document frequencies
+        """
+        for word, freq in nd.items():
+            # Standard TF-IDF formula with optional smoothing
+            if self.smooth_idf:
+                idf = math.log((self.corpus_size + 1) / (freq + 1)) + 1
+            else:
+                idf = math.log(self.corpus_size / freq)
+
+            self.idf[word] = idf
+
+    def get_scores(self, query):
+        """
+        Calculate TF-IDF scores for a query against all documents in the corpus.
+
+        Args:
+            query: List of query terms
+
+        Returns:
+            numpy array of scores for each document
+        """
+        score = np.zeros(self.corpus_size)
+
+        # Calculate TF-IDF for each term in the query
+        for q in query:
+            if q not in self.idf:
+                continue
+
+            # Term frequency in each document (using raw count as TF)
+            q_freq = np.array([(doc.get(q) or 0) for doc in self.doc_freqs])
+
+            # TF-IDF = term frequency * inverse document frequency
+            score += q_freq * self.idf.get(q, 0)
+
+        # Apply normalization if specified
+        if self.norm == "l1":
+            # L1 normalization (Manhattan distance)
+            norm_factors = np.sum(np.abs(score)) or 1  # Avoid division by zero
+            score = score / norm_factors
+        elif self.norm == "l2":
+            # L2 normalization (Euclidean distance)
+            norm_factors = np.sqrt(np.sum(score**2)) or 1  # Avoid division by zero
+            score = score / norm_factors
+
+        return score
+
+    def get_batch_scores(self, query, doc_ids):
+        """
+        Calculate TF-IDF scores between query and subset of documents.
+
+        Args:
+            query: List of query terms
+            doc_ids: List of document indices to score against
+
+        Returns:
+            List of scores for specified documents
+        """
+        assert all(di < len(self.doc_freqs) for di in doc_ids)
+        score = np.zeros(len(doc_ids))
+
+        # Calculate TF-IDF for each term in the query
+        for q in query:
+            if q not in self.idf:
+                continue
+
+            # Term frequency in selected documents
+            q_freq = np.array([(self.doc_freqs[di].get(q) or 0) for di in doc_ids])
+
+            # TF-IDF = term frequency * inverse document frequency
+            score += q_freq * self.idf.get(q, 0)
+
+        # Apply normalization if specified
+        if self.norm == "l1":
+            # L1 normalization (Manhattan distance)
+            norm_factors = np.sum(np.abs(score)) or 1  # Avoid division by zero
+            score = score / norm_factors
+        elif self.norm == "l2":
+            # L2 normalization (Euclidean distance)
+            norm_factors = np.sqrt(np.sum(score**2)) or 1  # Avoid division by zero
+            score = score / norm_factors
+
+        return score.tolist()
+
+
+class Jaccard(BM25):
+    def __init__(self, corpus, tokenizer=None):
+        """
+        Initialize the Jaccard similarity scoring model.
+
+        Args:
+            corpus: List of documents, where each document is a list of tokens
+            tokenizer: Optional tokenizer function to process raw text
+        """
+        super().__init__(corpus, tokenizer)
+        # Jaccard doesn't use IDF, so we'll override it with an empty dict
+        self.idf = {}
+
+    def _calc_idf(self, nd):
+        """
+        Jaccard similarity doesn't use IDF, so this is a no-op.
+        Required to satisfy the abstract base class.
+        """
+        pass
+
+    def get_scores(self, query):
+        """
+        Calculate Jaccard similarity scores for a query against all documents.
+        Jaccard similarity = |A ∩ B| / |A ∪ B|
+
+        Args:
+            query: List of query terms
+
+        Returns:
+            numpy array of Jaccard similarity scores for each document
+        """
+        scores = np.zeros(self.corpus_size)
+        query_set = set(query)
+
+        for i, doc_freq in enumerate(self.doc_freqs):
+            doc_set = set(doc_freq.keys())
+
+            # Calculate intersection and union
+            intersection = len(query_set & doc_set)
+            union = len(query_set | doc_set)
+
+            # Avoid division by zero
+            if union == 0:
+                scores[i] = 0.0
+            else:
+                scores[i] = intersection / union
+
+        return scores
+
+    def get_batch_scores(self, query, doc_ids):
+        """
+        Calculate Jaccard similarity scores for a query against a subset of documents.
+
+        Args:
+            query: List of query terms
+            doc_ids: List of document indices to score against
+
+        Returns:
+            List of Jaccard similarity scores for specified documents
+        """
+        assert all(di < len(self.doc_freqs) for di in doc_ids)
+        scores = np.zeros(len(doc_ids))
+        query_set = set(query)
+
+        for i, doc_id in enumerate(doc_ids):
+            doc_set = set(self.doc_freqs[doc_id].keys())
+
+            # Calculate intersection and union
+            intersection = len(query_set & doc_set)
+            union = len(query_set | doc_set)
+
+            # Avoid division by zero
+            if union == 0:
+                scores[i] = 0.0
+            else:
+                scores[i] = intersection / union
+
+        return scores.tolist()
 
 
 class BM25Okapi(BM25):
@@ -164,6 +461,7 @@ class BM25L(BM25):
             ctd = q_freq / (1 - self.b + self.b * doc_len / self.avgdl)
             score += (
                 (self.idf.get(q) or 0)
+                # * q_freq
                 * (self.k1 + 1)
                 * (ctd + self.delta)
                 / (self.k1 + ctd + self.delta)
@@ -182,6 +480,7 @@ class BM25L(BM25):
             ctd = q_freq / (1 - self.b + self.b * doc_len / self.avgdl)
             score += (
                 (self.idf.get(q) or 0)
+                # * q_freq
                 * (self.k1 + 1)
                 * (ctd + self.delta)
                 / (self.k1 + ctd + self.delta)
@@ -199,6 +498,7 @@ class BM25Plus(BM25):
 
     def _calc_idf(self, nd):
         for word, freq in nd.items():
+            # idf = math.log((self.corpus_size + 1) / freq)
             idf = math.log(self.corpus_size + 1) - math.log(freq)
             self.idf[word] = idf
 
@@ -231,6 +531,7 @@ class BM25Plus(BM25):
         return score.tolist()
 
 
+# TODO:
 # BM25Adpt and BM25T are a bit more complicated than the previous algorithms here. Here a term-specific k1
 # parameter is calculated before scoring is done
 
